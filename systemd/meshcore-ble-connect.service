@@ -1,0 +1,19 @@
+[Unit]
+Description=MeshCore BLE Bond Setup
+Documentation=https://github.com/user/meshcore-ble-connect
+After=bluetooth.target
+Wants=bluetooth.target
+
+[Service]
+Type=oneshot
+# Update the paths and MAC/PIN for your deployment:
+ExecStart=/path/to/venv/bin/meshcore-ble-connect AA:BB:CC:DD:EE:FF --pin 123456
+RemainAfterExit=yes
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

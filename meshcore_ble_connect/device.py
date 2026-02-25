@@ -428,7 +428,20 @@ class DeviceManager:
 
             # Step 2: Connect (direct Message, with retry on abort-by-local)
             await self._ble_connect(bus)
-            self._output.verbose("Connected — initiating SMP pairing")
+            self._output.verbose("Connected — stabilizing before SMP pairing")
+
+            # After abort-by-local retries, BlueZ needs time to fully
+            # stabilize the L2CAP link before SMP can run.  Without
+            # this delay, Pair() may hang indefinitely.
+            await asyncio.sleep(2.0)
+
+            # Confirm the connection is still alive before pairing
+            if not await self.is_connected():
+                raise PairingError(
+                    f"Connection to {self._mac} dropped before pairing"
+                )
+
+            self._output.verbose("Connection stable — initiating SMP pairing")
 
             # Step 3: Pair over existing connection (direct Message)
             # Timeout prevents indefinite hang if SMP negotiation stalls
@@ -468,11 +481,36 @@ class DeviceManager:
             ) from exc
         except PairingError:
             raise
-        except asyncio.TimeoutError as exc:
-            raise PairingError(
-                f"Connection to {self._mac} timed out. "
-                "Is the device powered on and in range?"
-            ) from exc
+        except asyncio.TimeoutError:
+            # BlueZ 5.82 quirk: Pair() D-Bus method may not return
+            # even though SMP completed successfully. Check if the
+            # device is actually paired before declaring failure.
+            logger.debug("Pair() timed out — checking if bond was established anyway")
+            if await self.is_paired():
+                self._output.field("Pairing", "success (late D-Bus return)")
+                logger.info(
+                    "Pairing successful for %s (Pair() timed out but "
+                    "bond exists)", self._mac
+                )
+                # Disconnect for clean state
+                try:
+                    await bus.call(
+                        Message(
+                            destination=BLUEZ_SERVICE,
+                            interface=DEVICE_INTERFACE,
+                            path=self._device_path,
+                            member="Disconnect",
+                        )
+                    )
+                except Exception:
+                    logger.debug("Disconnect after late pair (non-critical)")
+                # DON'T raise — pairing succeeded
+                return
+            else:
+                raise PairingError(
+                    f"Pairing with {self._mac} timed out after 30s. "
+                    "Device may be out of range or not responding."
+                )
         except Exception as exc:
             raise PairingError(
                 f"Pairing failed for {self._mac}: {exc}"

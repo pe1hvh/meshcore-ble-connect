@@ -8,7 +8,6 @@ v1.1: Added --connect mode that holds the BLE connection open after
 bond verification, printing READY to stdout when services are resolved.
 """
 
-import asyncio
 import logging
 
 from .adapter import AdapterManager
@@ -137,13 +136,8 @@ class BleConnectApp:
                 self._output.field("Bond", bond_info)
 
                 # Step 5: Verify bond with test connect
-                # When --connect mode is active, keep the connection
-                # open after verify so connect_and_hold() can reuse it
-                # instead of doing a disconnect→reconnect cycle.
                 self._output.field("Verify", "testing connection...")
-                bond_valid = await device.verify_bond(
-                    stay_connected=self._connect_hold,
-                )
+                bond_valid = await device.verify_bond()
 
                 if bond_valid:
                     self._output.field("Verify", "test connect OK")
@@ -193,10 +187,9 @@ class BleConnectApp:
         device and holds the connection open. Prints READY when services
         are resolved, then blocks until disconnect or signal.
 
-        If the device is already connected (from verify_bond with
-        stay_connected=True), connect_and_hold() reuses the link.
-        If not (after a fresh pairing), waits for BlueZ to settle
-        before reconnecting.
+        connect_and_hold() handles settle timing and retry logic
+        internally — it always starts from a disconnected state and
+        does a clean fresh connect.
 
         Args:
             device: The device manager for the target device.
@@ -205,17 +198,6 @@ class BleConnectApp:
             DISCONNECTED if device disconnects, OK if clean shutdown.
         """
         self._output.field("Mode", "connect-and-hold")
-
-        # After a fresh pair(), the device was disconnected as part of
-        # the SMP flow.  Give BlueZ time to fully tear down the L2CAP
-        # link before reconnecting, otherwise ServicesResolved may
-        # never become True.
-        if not await device.is_connected():
-            self._output.verbose(
-                "Device not connected — waiting 3s for BlueZ to settle "
-                "after pairing"
-            )
-            await asyncio.sleep(3.0)
 
         try:
             await device.connect_and_hold()

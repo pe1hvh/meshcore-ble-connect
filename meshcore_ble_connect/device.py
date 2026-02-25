@@ -152,25 +152,18 @@ class DeviceManager:
         except Exception:
             return False
 
-    async def verify_bond(self, stay_connected: bool = False) -> bool:
+    async def verify_bond(self) -> bool:
         """Verifies the bond with a test GATT connect.
 
-        Performs a connect via D-Bus to check if the device still
-        recognizes the bond. This detects stale bonds where BlueZ
-        has the key but the device has lost it (e.g. after a reboot
-        or reflash).
+        Performs a connect/disconnect cycle via D-Bus to check if the
+        device still recognizes the bond. This detects stale bonds
+        where BlueZ has the key but the device has lost it (e.g. after
+        a reboot or reflash).
 
         Uses the same retry logic as ``_ble_connect()`` to handle
         transient ``le-connection-abort-by-local`` errors that are
         common after discovery or recent BLE activity.  These are RF
         timing issues, NOT bond rejections.
-
-        Args:
-            stay_connected: When True, do NOT disconnect after a
-                successful verify.  Used by ``--connect`` mode so
-                that ``connect_and_hold()`` can reuse the already
-                established BLE link instead of doing a rapid
-                disconnect→reconnect cycle that confuses BlueZ.
 
         Returns:
             True if the test connect succeeded, False if rejected.
@@ -184,21 +177,20 @@ class DeviceManager:
             # Use _ble_connect which retries on le-connection-abort-by-local
             await self._ble_connect(bus)
 
-            if stay_connected:
-                self._output.verbose("Bond valid — keeping connection open for hold mode")
-            else:
-                # Bond is valid — disconnect cleanly
-                try:
-                    await bus.call(
-                        Message(
-                            destination=BLUEZ_SERVICE,
-                            interface=DEVICE_INTERFACE,
-                            path=self._device_path,
-                            member="Disconnect",
-                        )
+            # Bond is valid — always disconnect cleanly.
+            # connect_and_hold() will do its own fresh connect with
+            # proper settle timing for reliable GATT resolution.
+            try:
+                await bus.call(
+                    Message(
+                        destination=BLUEZ_SERVICE,
+                        interface=DEVICE_INTERFACE,
+                        path=self._device_path,
+                        member="Disconnect",
                     )
-                except Exception:
-                    logger.debug("Disconnect after verify failed (non-critical)")
+                )
+            except Exception:
+                logger.debug("Disconnect after verify failed (non-critical)")
             return True
 
         except (PairingError, asyncio.TimeoutError, Exception) as exc:
@@ -209,18 +201,21 @@ class DeviceManager:
         """Connects to the device and holds the connection open.
 
         This is the core of the --connect mode. After bond verification
-        succeeds, this method:
-        1. Connects via Device1.Connect()
-        2. Waits for ServicesResolved to become True
-        3. Prints READY to stdout (for the parent process)
-        4. Monitors for disconnect, printing DISCONNECTED on loss
+        (which always disconnects), this method:
+        1. Waits for BlueZ to settle after the verify disconnect
+        2. Connects via Device1.Connect()
+        3. Waits for ServicesResolved to become True
+        4. If ServicesResolved fails, disconnects, waits, retries once
+        5. Prints READY to stdout (for the parent process)
+        6. Monitors for disconnect, printing DISCONNECTED on loss
 
         The method blocks until the device disconnects or a signal
         (SIGTERM/SIGINT) is received. The parent process is expected
         to kill this process when done.
 
         Raises:
-            ConnectHoldError: If connect or service resolution fails.
+            ConnectHoldError: If connect or service resolution fails
+                after all attempts.
         """
         bus = self._bus_conn.bus
         shutdown_event = asyncio.Event()
@@ -239,33 +234,92 @@ class DeviceManager:
                 # Windows doesn't support add_signal_handler
                 pass
 
-        # ── Step 1: Connect via Device1.Connect() (skip if already connected) ──
-        already_connected = await self.is_connected()
-        if already_connected:
-            self._output.verbose(
-                "Already connected (from verify_bond) — "
-                "skipping Device1.Connect()"
-            )
-        else:
-            self._output.verbose("Connecting for hold mode")
-            await self._ble_connect(bus)
-        self._output.verbose("Connected — waiting for ServicesResolved")
+        # ── Step 1: Connect with retry on ServicesResolved failure ──
+        max_attempts = 2
+        for attempt in range(1, max_attempts + 1):
+            # Ensure we start from a clean disconnected state
+            if await self.is_connected():
+                self._output.verbose(
+                    f"Attempt {attempt}: device still connected, "
+                    "disconnecting first"
+                )
+                try:
+                    await bus.call(
+                        Message(
+                            destination=BLUEZ_SERVICE,
+                            interface=DEVICE_INTERFACE,
+                            path=self._device_path,
+                            member="Disconnect",
+                        )
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(2.0)
 
-        # ── Step 2: Wait for ServicesResolved ──
-        resolved = await self._wait_for_services_resolved()
-        if not resolved:
-            raise ConnectHoldError(
-                f"ServicesResolved did not become True within "
-                f"{SERVICES_RESOLVED_TIMEOUT}s for {self._mac}"
+            # Settle delay — give BlueZ time to fully tear down any
+            # previous L2CAP link before starting a fresh connect.
+            settle = 3.0 if attempt == 1 else 5.0
+            self._output.verbose(
+                f"Attempt {attempt}/{max_attempts}: "
+                f"waiting {settle:.0f}s for BlueZ to settle"
             )
+            await asyncio.sleep(settle)
+
+            # Connect
+            self._output.verbose(f"Attempt {attempt}/{max_attempts}: connecting")
+            try:
+                await self._ble_connect(bus)
+            except PairingError as exc:
+                if attempt < max_attempts:
+                    self._output.verbose(
+                        f"Attempt {attempt}: connect failed: {exc}, retrying"
+                    )
+                    continue
+                raise ConnectHoldError(
+                    f"Connect failed after {max_attempts} attempts: {exc}"
+                ) from exc
+
+            self._output.verbose(
+                f"Attempt {attempt}/{max_attempts}: "
+                "connected — waiting for ServicesResolved"
+            )
+
+            # Wait for ServicesResolved
+            resolved = await self._wait_for_services_resolved()
+            if resolved:
+                break
+
+            # ServicesResolved failed
+            if attempt < max_attempts:
+                self._output.verbose(
+                    f"Attempt {attempt}: ServicesResolved timeout, "
+                    "will disconnect and retry"
+                )
+                try:
+                    await bus.call(
+                        Message(
+                            destination=BLUEZ_SERVICE,
+                            interface=DEVICE_INTERFACE,
+                            path=self._device_path,
+                            member="Disconnect",
+                        )
+                    )
+                except Exception:
+                    pass
+                continue
+            else:
+                raise ConnectHoldError(
+                    f"ServicesResolved did not become True after "
+                    f"{max_attempts} connect attempts for {self._mac}"
+                )
 
         self._output.field("Services", "resolved")
 
-        # ── Step 3: Print READY to stdout (parent reads this) ──
+        # ── Step 2: Print READY to stdout (parent reads this) ──
         print("READY", flush=True)
         logger.info("Connect hold: READY for %s", self._mac)
 
-        # ── Step 4: Monitor for disconnect ──
+        # ── Step 3: Monitor for disconnect ──
         self._output.verbose("Holding connection — waiting for disconnect or signal")
         await self._monitor_connection(shutdown_event)
 

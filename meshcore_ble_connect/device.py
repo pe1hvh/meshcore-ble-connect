@@ -133,9 +133,7 @@ class DeviceManager:
             True if the Device1.Connected property is true.
         """
         try:
-            props = await self._get_device_properties()
-            connected = await props.call_get(DEVICE_INTERFACE, "Connected")
-            return bool(connected.value)
+            return bool(await self._get_property_direct("Connected"))
         except Exception:
             return False
 
@@ -146,9 +144,7 @@ class DeviceManager:
             True if the Device1.ServicesResolved property is true.
         """
         try:
-            props = await self._get_device_properties()
-            resolved = await props.call_get(DEVICE_INTERFACE, "ServicesResolved")
-            return bool(resolved.value)
+            return bool(await self._get_property_direct("ServicesResolved"))
         except Exception:
             return False
 
@@ -235,7 +231,7 @@ class DeviceManager:
                 pass
 
         # ── Step 1: Connect with retry on ServicesResolved failure ──
-        max_attempts = 2
+        max_attempts = 3
         for attempt in range(1, max_attempts + 1):
             # Ensure we start from a clean disconnected state
             if await self.is_connected():
@@ -258,7 +254,8 @@ class DeviceManager:
 
             # Settle delay — give BlueZ time to fully tear down any
             # previous L2CAP link before starting a fresh connect.
-            settle = 3.0 if attempt == 1 else 5.0
+            # Longer on later attempts to recover from radio congestion.
+            settle = 3.0 + (attempt - 1) * 3.0  # 3s, 6s, 9s
             self._output.verbose(
                 f"Attempt {attempt}/{max_attempts}: "
                 f"waiting {settle:.0f}s for BlueZ to settle"
@@ -341,19 +338,24 @@ class DeviceManager:
     async def _wait_for_services_resolved(self) -> bool:
         """Polls ServicesResolved until True or timeout.
 
-        Uses polling instead of D-Bus signals for maximum compatibility
-        across BlueZ versions. The poll interval is short (0.25s) so
-        the latency is negligible.
+        Uses direct D-Bus property Get messages instead of proxy
+        introspection for reliability and efficiency. Proxy-based
+        reads do introspect→get_proxy→call_get (3 roundtrips per poll);
+        direct messages do a single Get call.
 
         Returns:
             True if services were resolved within the timeout.
         """
         deadline = asyncio.get_event_loop().time() + SERVICES_RESOLVED_TIMEOUT
-        poll_interval = 0.25
+        poll_interval = 0.5
 
         while asyncio.get_event_loop().time() < deadline:
-            if await self.is_services_resolved():
-                return True
+            try:
+                resolved = await self._get_property_direct("ServicesResolved")
+                if resolved:
+                    return True
+            except Exception as exc:
+                logger.debug("ServicesResolved poll error: %s", exc)
             await asyncio.sleep(poll_interval)
 
         logger.warning(
@@ -361,6 +363,27 @@ class DeviceManager:
             self._mac, SERVICES_RESOLVED_TIMEOUT,
         )
         return False
+
+    async def _get_property_direct(self, prop_name: str):
+        """Read a Device1 property via direct D-Bus message.
+
+        Avoids proxy introspection overhead. Returns the unwrapped
+        property value.
+        """
+        reply = await self._bus_conn.bus.call(
+            Message(
+                destination=BLUEZ_SERVICE,
+                path=self._device_path,
+                interface=PROPERTIES_INTERFACE,
+                member="Get",
+                signature="ss",
+                body=[DEVICE_INTERFACE, prop_name],
+            )
+        )
+        if reply.message_type == MessageType.ERROR:
+            raise Exception(f"Property {prop_name}: {reply.error_name}")
+        # reply.body[0] is a Variant, .value gives the actual value
+        return reply.body[0].value
 
     async def _monitor_connection(self, shutdown_event: asyncio.Event) -> None:
         """Monitors the connection until disconnect or shutdown signal.

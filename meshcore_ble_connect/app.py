@@ -136,6 +136,18 @@ class BleConnectApp:
                 self._output.field("Bond", bond_info)
 
                 # Step 5: Verify bond with test connect
+                # In --connect mode, skip verify_bond entirely.
+                # verify_bond does Connect→Disconnect, then connect_and_hold
+                # does another Connect. That double cycle causes repeated
+                # le-connection-abort-by-local which corrupts BlueZ GATT
+                # client state → ServicesResolved never becomes True.
+                # connect_and_hold itself is the verification: if Connect
+                # fails with auth error, the bond is invalid.
+                if self._connect_hold:
+                    self._output.field("Verify", "skipped (--connect will verify)")
+                    await device.trust()
+                    return await self._enter_connect_hold(device)
+
                 self._output.field("Verify", "testing connection...")
                 bond_valid = await device.verify_bond()
 

@@ -4,11 +4,16 @@ Handles all device-level operations: existence check, paired status,
 bond verification (test connect), pairing, trust, and removal.
 All operations use the BlueZ Device1 D-Bus interface directly.
 
+v1.1: Added connect_and_hold() for --connect mode — maintains a
+persistent BLE connection and monitors for disconnect.
+
 See design document §4 (steps 3-9), §7.1, and §7.3.
 """
 
 import asyncio
 import logging
+import signal
+import sys
 
 from dbus_fast import Message, MessageType, Variant
 from dbus_fast.errors import DBusError
@@ -27,11 +32,13 @@ from .constants import (
     CONNECT_TIMEOUT,
     DEVICE_INTERFACE,
     AGENT_CAPABILITY,
+    DISCONNECT_POLL_INTERVAL,
     OBJECT_MANAGER_INTERFACE,
     PROPERTIES_INTERFACE,
+    SERVICES_RESOLVED_TIMEOUT,
     mac_to_device_path,
 )
-from .exceptions import BondVerificationError, PairingError
+from .exceptions import BondVerificationError, ConnectHoldError, PairingError
 from .output import OutputFormatter
 
 logger = logging.getLogger(__name__)
@@ -119,6 +126,32 @@ class DeviceManager:
         except Exception:
             return False
 
+    async def is_connected(self) -> bool:
+        """Checks if the device is currently connected in BlueZ.
+
+        Returns:
+            True if the Device1.Connected property is true.
+        """
+        try:
+            props = await self._get_device_properties()
+            connected = await props.call_get(DEVICE_INTERFACE, "Connected")
+            return bool(connected.value)
+        except Exception:
+            return False
+
+    async def is_services_resolved(self) -> bool:
+        """Checks if GATT services have been resolved.
+
+        Returns:
+            True if the Device1.ServicesResolved property is true.
+        """
+        try:
+            props = await self._get_device_properties()
+            resolved = await props.call_get(DEVICE_INTERFACE, "ServicesResolved")
+            return bool(resolved.value)
+        except Exception:
+            return False
+
     async def verify_bond(self) -> bool:
         """Verifies the bond with a test GATT connect.
 
@@ -151,6 +184,137 @@ class DeviceManager:
         except (DBusError, asyncio.TimeoutError, Exception) as exc:
             logger.debug("Bond verification failed: %s", exc)
             return False
+
+    async def connect_and_hold(self) -> None:
+        """Connects to the device and holds the connection open.
+
+        This is the core of the --connect mode. After bond verification
+        succeeds, this method:
+        1. Connects via Device1.Connect()
+        2. Waits for ServicesResolved to become True
+        3. Prints READY to stdout (for the parent process)
+        4. Monitors for disconnect, printing DISCONNECTED on loss
+
+        The method blocks until the device disconnects or a signal
+        (SIGTERM/SIGINT) is received. The parent process is expected
+        to kill this process when done.
+
+        Raises:
+            ConnectHoldError: If connect or service resolution fails.
+        """
+        bus = self._bus_conn.bus
+        shutdown_event = asyncio.Event()
+
+        # ── Install signal handlers for clean shutdown ──
+        loop = asyncio.get_running_loop()
+
+        def _signal_handler():
+            logger.debug("Signal received, shutting down connect hold")
+            shutdown_event.set()
+
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, _signal_handler)
+            except NotImplementedError:
+                # Windows doesn't support add_signal_handler
+                pass
+
+        # ── Step 1: Connect via Device1.Connect() ──
+        self._output.verbose("Connecting for hold mode")
+        await self._ble_connect(bus)
+        self._output.verbose("Connected — waiting for ServicesResolved")
+
+        # ── Step 2: Wait for ServicesResolved ──
+        resolved = await self._wait_for_services_resolved()
+        if not resolved:
+            raise ConnectHoldError(
+                f"ServicesResolved did not become True within "
+                f"{SERVICES_RESOLVED_TIMEOUT}s for {self._mac}"
+            )
+
+        self._output.field("Services", "resolved")
+
+        # ── Step 3: Print READY to stdout (parent reads this) ──
+        print("READY", flush=True)
+        logger.info("Connect hold: READY for %s", self._mac)
+
+        # ── Step 4: Monitor for disconnect ──
+        self._output.verbose("Holding connection — waiting for disconnect or signal")
+        await self._monitor_connection(shutdown_event)
+
+        # ── Cleanup: disconnect if still connected ──
+        try:
+            if await self.is_connected():
+                self._output.verbose("Disconnecting on shutdown")
+                await bus.call(
+                    Message(
+                        destination=BLUEZ_SERVICE,
+                        interface=DEVICE_INTERFACE,
+                        path=self._device_path,
+                        member="Disconnect",
+                    )
+                )
+        except Exception:
+            logger.debug("Disconnect on shutdown failed (non-critical)")
+
+    async def _wait_for_services_resolved(self) -> bool:
+        """Polls ServicesResolved until True or timeout.
+
+        Uses polling instead of D-Bus signals for maximum compatibility
+        across BlueZ versions. The poll interval is short (0.25s) so
+        the latency is negligible.
+
+        Returns:
+            True if services were resolved within the timeout.
+        """
+        deadline = asyncio.get_event_loop().time() + SERVICES_RESOLVED_TIMEOUT
+        poll_interval = 0.25
+
+        while asyncio.get_event_loop().time() < deadline:
+            if await self.is_services_resolved():
+                return True
+            await asyncio.sleep(poll_interval)
+
+        logger.warning(
+            "ServicesResolved timeout for %s after %.0fs",
+            self._mac, SERVICES_RESOLVED_TIMEOUT,
+        )
+        return False
+
+    async def _monitor_connection(self, shutdown_event: asyncio.Event) -> None:
+        """Monitors the connection until disconnect or shutdown signal.
+
+        Polls the Connected property at regular intervals. When the
+        device disconnects, prints DISCONNECTED to stdout so the parent
+        process can detect it.
+
+        Args:
+            shutdown_event: Set when SIGTERM/SIGINT is received.
+        """
+        while not shutdown_event.is_set():
+            try:
+                if not await self.is_connected():
+                    print("DISCONNECTED", flush=True)
+                    logger.info("Device %s disconnected", self._mac)
+                    return
+            except Exception as exc:
+                # D-Bus error likely means device was removed
+                logger.debug("Connection check failed: %s", exc)
+                print("DISCONNECTED", flush=True)
+                return
+
+            # Wait for either the poll interval or shutdown signal
+            try:
+                await asyncio.wait_for(
+                    shutdown_event.wait(),
+                    timeout=DISCONNECT_POLL_INTERVAL,
+                )
+                # shutdown_event was set
+                logger.debug("Shutdown event received during monitor")
+                return
+            except asyncio.TimeoutError:
+                # Normal: poll interval elapsed, loop continues
+                pass
 
     async def pair(self, agent: PairingAgent) -> None:
         """Pairs with the device using the provided PIN agent.
@@ -409,4 +573,3 @@ class DeviceManager:
         """
         proxy = await self._bus_conn.get_proxy(self._device_path)
         return proxy.get_interface(PROPERTIES_INTERFACE)
-

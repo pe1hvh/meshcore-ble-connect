@@ -5,7 +5,7 @@ Single source of truth for version, exit codes, and D-Bus paths.
 
 from enum import IntEnum
 
-VERSION: str = "1.0.0"
+VERSION: str = "1.1.0"
 TOOL_NAME: str = "meshcore-ble-connect"
 
 # D-Bus constants
@@ -31,6 +31,10 @@ DISCOVERY_TIMEOUT: float = 30.0
 CONNECT_TIMEOUT: float = 10.0
 CONNECT_RETRIES: int = 5
 CONNECT_RETRY_DELAY: float = 1.0
+
+# --connect mode timeouts
+SERVICES_RESOLVED_TIMEOUT: float = 15.0
+DISCONNECT_POLL_INTERVAL: float = 1.0
 
 # PIN constraints
 PIN_MAX_LENGTH: int = 16
@@ -58,6 +62,8 @@ class ExitCode(IntEnum):
         PAIRING_FAILED: Pairing failed (wrong PIN, device unreachable).
         ADAPTER_ERROR: Adapter problem (not powered, not found).
         DBUS_PERMISSION: D-Bus permission error.
+        CONNECT_FAILED: --connect mode: connect or services resolved failed.
+        DISCONNECTED: --connect mode: device disconnected while holding.
     """
 
     OK = 0
@@ -65,3 +71,5 @@ class ExitCode(IntEnum):
     PAIRING_FAILED = 2
     ADAPTER_ERROR = 3
     DBUS_PERMISSION = 4
+    CONNECT_FAILED = 5
+    DISCONNECTED = 6

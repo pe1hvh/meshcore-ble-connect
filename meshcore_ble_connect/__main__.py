@@ -2,6 +2,8 @@
 
 Parses CLI arguments as defined in design §6.1, configures logging,
 creates the appropriate PinProvider, and runs the connection manager.
+
+v1.1: Added --connect flag for persistent connection mode.
 """
 
 import argparse
@@ -51,6 +53,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--force-repair",
         action="store_true",
         help="Skip verification, remove bond and re-pair",
+    )
+    parser.add_argument(
+        "--connect",
+        action="store_true",
+        help=(
+            "After bond verification, connect to the device and hold "
+            "the connection open. Prints READY to stdout when GATT "
+            "services are resolved. Stays running until killed or "
+            "device disconnects. For use as a subprocess by applications "
+            "that need a persistent BLE connection."
+        ),
     )
     parser.add_argument(
         "--verbose",
@@ -112,6 +125,13 @@ def main() -> None:
         )
         sys.exit(ExitCode.PAIRING_FAILED)
 
+    if args.check_only and args.connect:
+        print(
+            "Error: --check-only and --connect are mutually exclusive",
+            file=sys.stderr,
+        )
+        sys.exit(ExitCode.PAIRING_FAILED)
+
     # Create the appropriate PIN provider
     output = OutputFormatter(verbose=args.verbose)
     if args.pin is not None:
@@ -125,6 +145,7 @@ def main() -> None:
         pin_provider=pin_provider,
         force_repair=args.force_repair,
         check_only=args.check_only,
+        connect_hold=args.connect,
         verbose=args.verbose,
     )
 

@@ -38,6 +38,14 @@ class BondVerificationError(BleConnectError):
     """
 
 
+class ConnectHoldError(BleConnectError):
+    """Connect-and-hold mode failed — could not establish or maintain connection.
+
+    Maps to ExitCode.CONNECT_FAILED (5). Used when --connect mode
+    cannot complete Device1.Connect() or ServicesResolved times out.
+    """
+
+
 class DbusPermissionError(BleConnectError):
     """Insufficient permissions to access D-Bus system bus or BlueZ.
 

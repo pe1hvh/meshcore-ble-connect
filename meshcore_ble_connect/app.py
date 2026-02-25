@@ -3,6 +3,9 @@
 Implements the main flow from design §4: adapter check → device check →
 bond verification → pairing → trust. Coordinates all components and
 translates exceptions to exit codes.
+
+v1.1: Added --connect mode that holds the BLE connection open after
+bond verification, printing READY to stdout when services are resolved.
 """
 
 import logging
@@ -16,6 +19,7 @@ from .discovery import Discovery
 from .exceptions import (
     AdapterError,
     BleConnectError,
+    ConnectHoldError,
     DbusPermissionError,
     DiscoveryError,
     PairingError,
@@ -38,6 +42,7 @@ class BleConnectApp:
         pin_provider: Provider for obtaining the PIN code.
         force_repair: Skip verification and force re-pairing.
         check_only: Only check bond status, do not pair.
+        connect_hold: After bond, connect and hold open (--connect mode).
         verbose: Enable verbose output.
     """
 
@@ -47,12 +52,14 @@ class BleConnectApp:
         pin_provider: PinProvider,
         force_repair: bool = False,
         check_only: bool = False,
+        connect_hold: bool = False,
         verbose: bool = False,
     ) -> None:
         self._mac = mac.upper()
         self._pin_provider = pin_provider
         self._force_repair = force_repair
         self._check_only = check_only
+        self._connect_hold = connect_hold
         self._output = OutputFormatter(verbose=verbose)
         self._bus_conn = BusConnection()
 
@@ -71,6 +78,9 @@ class BleConnectApp:
         except AdapterError as exc:
             self._output.error(str(exc))
             return ExitCode.ADAPTER_ERROR
+        except ConnectHoldError as exc:
+            self._output.error(str(exc))
+            return ExitCode.CONNECT_FAILED
         except (PairingError, DiscoveryError) as exc:
             self._output.error(str(exc))
             return ExitCode.PAIRING_FAILED
@@ -82,6 +92,8 @@ class BleConnectApp:
             logger.exception("Unexpected error")
             return ExitCode.PAIRING_FAILED
         finally:
+            # In --connect mode, the bus stays open during hold.
+            # Disconnect is called here when hold ends (signal or device loss).
             await self._bus_conn.disconnect()
 
     async def _execute_flow(self) -> ExitCode:
@@ -92,7 +104,8 @@ class BleConnectApp:
         2. Adapter pairable? → enable
         3. Device known? → check paired → verify bond → pair if needed
         4. Trust device
-        5. Exit with appropriate code
+        5. (--connect mode) Connect and hold open
+        6. Exit with appropriate code
 
         Returns:
             The appropriate ExitCode.
@@ -110,7 +123,10 @@ class BleConnectApp:
 
         # Handle --force-repair: skip verification, remove and re-pair
         if self._force_repair:
-            return await self._handle_force_repair(device)
+            result = await self._handle_force_repair(device)
+            if result == ExitCode.OK and self._connect_hold:
+                return await self._enter_connect_hold(device)
+            return result
 
         # Step 3: Check if device is known to BlueZ
         if await device.device_exists():
@@ -132,6 +148,10 @@ class BleConnectApp:
                     # Step 9: Ensure trusted
                     await device.trust()
                     self._output.result("Bond verified \u2014 ready to connect")
+
+                    # --connect mode: hold connection open
+                    if self._connect_hold:
+                        return await self._enter_connect_hold(device)
                     return ExitCode.OK
                 else:
                     # Step 6: Bond is invalid — remove and re-pair
@@ -155,7 +175,33 @@ class BleConnectApp:
             return ExitCode.BOND_INVALID
 
         # Pairing flow (§5.1 / §5.3)
-        return await self._pair_flow(device)
+        result = await self._pair_flow(device)
+        if result == ExitCode.OK and self._connect_hold:
+            return await self._enter_connect_hold(device)
+        return result
+
+    async def _enter_connect_hold(self, device: DeviceManager) -> ExitCode:
+        """Enters the connect-and-hold mode.
+
+        After bond is verified or freshly established, connects to the
+        device and holds the connection open. Prints READY when services
+        are resolved, then blocks until disconnect or signal.
+
+        Args:
+            device: The device manager for the target device.
+
+        Returns:
+            DISCONNECTED if device disconnects, OK if clean shutdown.
+        """
+        self._output.field("Mode", "connect-and-hold")
+
+        try:
+            await device.connect_and_hold()
+            # connect_and_hold() returned — either signal or disconnect
+            return ExitCode.DISCONNECTED
+        except ConnectHoldError as exc:
+            self._output.error(str(exc))
+            return ExitCode.CONNECT_FAILED
 
     async def _pair_flow(self, device: DeviceManager) -> ExitCode:
         """Executes the discovery + pairing + trust flow.

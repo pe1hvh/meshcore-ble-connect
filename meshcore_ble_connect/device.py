@@ -160,28 +160,38 @@ class DeviceManager:
         bonds where BlueZ has the key but the device has lost it
         (e.g. after a reboot or reflash).
 
+        Uses the same retry logic as ``_ble_connect()`` to handle
+        transient ``le-connection-abort-by-local`` errors that are
+        common after discovery or recent BLE activity.  These are RF
+        timing issues, NOT bond rejections.
+
         Returns:
             True if the test connect succeeded, False if rejected.
 
         See design document §7.3.
         """
         self._output.verbose("Verifying bond with test connect")
-        try:
-            device_proxy = await self._bus_conn.get_proxy(self._device_path)
-            device_iface = device_proxy.get_interface(DEVICE_INTERFACE)
+        bus = self._bus_conn.bus
 
-            await asyncio.wait_for(
-                device_iface.call_connect(),
-                timeout=CONNECT_TIMEOUT,
-            )
+        try:
+            # Use _ble_connect which retries on le-connection-abort-by-local
+            await self._ble_connect(bus)
+
             # Bond is valid — disconnect cleanly
             try:
-                await device_iface.call_disconnect()
+                await bus.call(
+                    Message(
+                        destination=BLUEZ_SERVICE,
+                        interface=DEVICE_INTERFACE,
+                        path=self._device_path,
+                        member="Disconnect",
+                    )
+                )
             except Exception:
                 logger.debug("Disconnect after verify failed (non-critical)")
             return True
 
-        except (DBusError, asyncio.TimeoutError, Exception) as exc:
+        except (PairingError, asyncio.TimeoutError, Exception) as exc:
             logger.debug("Bond verification failed: %s", exc)
             return False
 
@@ -350,13 +360,17 @@ class DeviceManager:
             self._output.verbose("Connected — initiating SMP pairing")
 
             # Step 3: Pair over existing connection (direct Message)
-            reply = await bus.call(
-                Message(
-                    destination=BLUEZ_SERVICE,
-                    interface=DEVICE_INTERFACE,
-                    path=self._device_path,
-                    member="Pair",
-                )
+            # Timeout prevents indefinite hang if SMP negotiation stalls
+            reply = await asyncio.wait_for(
+                bus.call(
+                    Message(
+                        destination=BLUEZ_SERVICE,
+                        interface=DEVICE_INTERFACE,
+                        path=self._device_path,
+                        member="Pair",
+                    )
+                ),
+                timeout=30.0,
             )
             if reply.message_type == MessageType.ERROR:
                 raise DBusError(reply.error_name, reply.body[0] if reply.body else "Pair failed")

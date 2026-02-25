@@ -136,8 +136,13 @@ class BleConnectApp:
                 self._output.field("Bond", bond_info)
 
                 # Step 5: Verify bond with test connect
+                # When --connect mode is active, keep the connection
+                # open after verify so connect_and_hold() can reuse it
+                # instead of doing a disconnect→reconnect cycle.
                 self._output.field("Verify", "testing connection...")
-                bond_valid = await device.verify_bond()
+                bond_valid = await device.verify_bond(
+                    stay_connected=self._connect_hold,
+                )
 
                 if bond_valid:
                     self._output.field("Verify", "test connect OK")

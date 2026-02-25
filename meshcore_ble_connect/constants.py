@@ -33,7 +33,7 @@ CONNECT_RETRIES: int = 5
 CONNECT_RETRY_DELAY: float = 1.0
 
 # --connect mode timeouts
-SERVICES_RESOLVED_TIMEOUT: float = 15.0
+SERVICES_RESOLVED_TIMEOUT: float = 30.0
 DISCONNECT_POLL_INTERVAL: float = 1.0
 
 # PIN constraints

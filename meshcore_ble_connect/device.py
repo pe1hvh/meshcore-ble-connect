@@ -152,18 +152,25 @@ class DeviceManager:
         except Exception:
             return False
 
-    async def verify_bond(self) -> bool:
+    async def verify_bond(self, stay_connected: bool = False) -> bool:
         """Verifies the bond with a test GATT connect.
 
-        Performs a short connect/disconnect cycle via D-Bus to check
-        if the device still recognizes the bond. This detects stale
-        bonds where BlueZ has the key but the device has lost it
-        (e.g. after a reboot or reflash).
+        Performs a connect via D-Bus to check if the device still
+        recognizes the bond. This detects stale bonds where BlueZ
+        has the key but the device has lost it (e.g. after a reboot
+        or reflash).
 
         Uses the same retry logic as ``_ble_connect()`` to handle
         transient ``le-connection-abort-by-local`` errors that are
         common after discovery or recent BLE activity.  These are RF
         timing issues, NOT bond rejections.
+
+        Args:
+            stay_connected: When True, do NOT disconnect after a
+                successful verify.  Used by ``--connect`` mode so
+                that ``connect_and_hold()`` can reuse the already
+                established BLE link instead of doing a rapid
+                disconnect→reconnect cycle that confuses BlueZ.
 
         Returns:
             True if the test connect succeeded, False if rejected.
@@ -177,18 +184,21 @@ class DeviceManager:
             # Use _ble_connect which retries on le-connection-abort-by-local
             await self._ble_connect(bus)
 
-            # Bond is valid — disconnect cleanly
-            try:
-                await bus.call(
-                    Message(
-                        destination=BLUEZ_SERVICE,
-                        interface=DEVICE_INTERFACE,
-                        path=self._device_path,
-                        member="Disconnect",
+            if stay_connected:
+                self._output.verbose("Bond valid — keeping connection open for hold mode")
+            else:
+                # Bond is valid — disconnect cleanly
+                try:
+                    await bus.call(
+                        Message(
+                            destination=BLUEZ_SERVICE,
+                            interface=DEVICE_INTERFACE,
+                            path=self._device_path,
+                            member="Disconnect",
+                        )
                     )
-                )
-            except Exception:
-                logger.debug("Disconnect after verify failed (non-critical)")
+                except Exception:
+                    logger.debug("Disconnect after verify failed (non-critical)")
             return True
 
         except (PairingError, asyncio.TimeoutError, Exception) as exc:
@@ -229,9 +239,16 @@ class DeviceManager:
                 # Windows doesn't support add_signal_handler
                 pass
 
-        # ── Step 1: Connect via Device1.Connect() ──
-        self._output.verbose("Connecting for hold mode")
-        await self._ble_connect(bus)
+        # ── Step 1: Connect via Device1.Connect() (skip if already connected) ──
+        already_connected = await self.is_connected()
+        if already_connected:
+            self._output.verbose(
+                "Already connected (from verify_bond) — "
+                "skipping Device1.Connect()"
+            )
+        else:
+            self._output.verbose("Connecting for hold mode")
+            await self._ble_connect(bus)
         self._output.verbose("Connected — waiting for ServicesResolved")
 
         # ── Step 2: Wait for ServicesResolved ──

@@ -462,7 +462,27 @@ class DeviceManager:
             self._output.field("Pairing", "success")
             logger.info("Pairing successful for %s", self._mac)
 
-            # Step 4: Disconnect (application will connect later)
+            # Step 4: Wait for ServicesResolved to populate BlueZ GATT cache.
+            # After SMP pairing, the device is still connected. If we
+            # disconnect immediately, BlueZ never completes GATT discovery
+            # and the on-disk cache stays empty. On the next connect,
+            # BlueZ has no cache to fall back on, and after multiple
+            # le-connection-abort-by-local retries the GATT client may
+            # fail to initialize → ServicesResolved never becomes True.
+            # By waiting here, the cache is populated and future connects
+            # resolve instantly.
+            self._output.verbose("Waiting for GATT service resolution (cache fill)")
+            resolved = await self._wait_for_services_resolved()
+            if resolved:
+                self._output.verbose("GATT services resolved — cache populated")
+            else:
+                # Non-fatal: cache won't be filled but pairing succeeded.
+                # connect_and_hold may still work via fresh discovery.
+                self._output.verbose(
+                    "GATT resolution timeout after pair — cache may be empty"
+                )
+
+            # Step 5: Disconnect (application will connect later)
             try:
                 await bus.call(
                     Message(
@@ -492,6 +512,9 @@ class DeviceManager:
                     "Pairing successful for %s (Pair() timed out but "
                     "bond exists)", self._mac
                 )
+                # Wait for GATT cache fill (same as normal path)
+                self._output.verbose("Waiting for GATT resolution (late pair)")
+                await self._wait_for_services_resolved()
                 # Disconnect for clean state
                 try:
                     await bus.call(

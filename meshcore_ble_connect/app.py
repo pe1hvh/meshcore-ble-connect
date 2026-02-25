@@ -8,6 +8,7 @@ v1.1: Added --connect mode that holds the BLE connection open after
 bond verification, printing READY to stdout when services are resolved.
 """
 
+import asyncio
 import logging
 
 from .adapter import AdapterManager
@@ -192,6 +193,11 @@ class BleConnectApp:
         device and holds the connection open. Prints READY when services
         are resolved, then blocks until disconnect or signal.
 
+        If the device is already connected (from verify_bond with
+        stay_connected=True), connect_and_hold() reuses the link.
+        If not (after a fresh pairing), waits for BlueZ to settle
+        before reconnecting.
+
         Args:
             device: The device manager for the target device.
 
@@ -199,6 +205,17 @@ class BleConnectApp:
             DISCONNECTED if device disconnects, OK if clean shutdown.
         """
         self._output.field("Mode", "connect-and-hold")
+
+        # After a fresh pair(), the device was disconnected as part of
+        # the SMP flow.  Give BlueZ time to fully tear down the L2CAP
+        # link before reconnecting, otherwise ServicesResolved may
+        # never become True.
+        if not await device.is_connected():
+            self._output.verbose(
+                "Device not connected — waiting 3s for BlueZ to settle "
+                "after pairing"
+            )
+            await asyncio.sleep(3.0)
 
         try:
             await device.connect_and_hold()
